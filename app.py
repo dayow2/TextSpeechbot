@@ -4,6 +4,7 @@ from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from gtts import gTTS
+import asyncio
 
 # === CONFIGURATION ===
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -73,7 +74,7 @@ async def help_command(update: Update, context):
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
 # === MAIN FUNCTION ===
-def run_bot():
+async def main():
     """Initialize and run the Telegram bot."""
     # Create application
     application = Application.builder().token(TOKEN).build()
@@ -83,8 +84,22 @@ def run_bot():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_to_speech))
     
-    # Start bot (using polling - works with Flask in background)
-    application.run_polling()
+    # Start bot (using polling)
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    
+    # Keep the bot running
+    print("Bot is running...")
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
 
 # === ENTRY POINT ===
 if __name__ == "__main__":
@@ -92,10 +107,16 @@ if __name__ == "__main__":
     
     # Run Flask in a separate thread for health checks
     def run_flask():
-        app.run(host='0.0.0.0', port=PORT)
+        app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
     
     flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
     flask_thread.start()
     
     # Run the bot
-    run_bot()
+    try:
+        asyncio.run(main())
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(main())
