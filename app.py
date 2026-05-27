@@ -1,122 +1,105 @@
 import os
 import io
-from flask import Flask
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from flask import Flask, request, jsonify
+import requests
 from gtts import gTTS
-import asyncio
 
 # === CONFIGURATION ===
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 PORT = int(os.environ.get("PORT", 5000))
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
-# === FLASK APP for Render Health Checks ===
 app = Flask(__name__)
 
-@app.route('/')
+def send_message(chat_id, text, parse_mode=None):
+    """Send text message to Telegram"""
+    url = f"{TELEGRAM_API_URL}/sendMessage"
+    data = {
+        "chat_id": chat_id,
+        "text": text
+    }
+    if parse_mode:
+        data["parse_mode"] = parse_mode
+    requests.post(url, json=data)
+
+def send_voice(chat_id, audio_bytes, caption=None):
+    """Send voice message to Telegram"""
+    url = f"{TELEGRAM_API_URL}/sendVoice"
+    files = {
+        "voice": ("speech.ogg", audio_bytes, "audio/ogg")
+    }
+    data = {
+        "chat_id": chat_id
+    }
+    if caption:
+        data["caption"] = caption
+    requests.post(url, data=data, files=files)
+
 @app.route('/health')
-def health_check():
-    return "Bot is running!", 200
+def health():
+    return "OK", 200
 
-# === TELEGRAM BOT HANDLERS ===
-async def start(update: Update, context):
-    """Send welcome message when /start is issued."""
-    welcome_text = (
-        "🎤 *Welcome to Text to Speech Bot!*\n\n"
-        "Send me any text, and I'll convert it to voice.\n\n"
-        "*Features:*\n"
-        "• Supports multiple languages\n"
-        "• Fast & free\n"
-        "• Works with any text up to 1000 chars\n\n"
-        "Just type your message and I'll reply with voice! 🗣️"
-    )
-    await update.message.reply_text(welcome_text, parse_mode='Markdown')
-
-async def text_to_speech(update: Update, context):
-    """Convert text message to speech and send as voice."""
-    text = update.message.text
-    
-    # Limit text length to avoid issues
-    if len(text) > 1000:
-        await update.message.reply_text("⚠️ Text is too long! Please send less than 1000 characters.")
-        return
-    
+@app.route(f'/webhook/{TOKEN}', methods=['POST'])
+def webhook():
+    """Handle incoming messages"""
     try:
-        # Create audio file in memory (no disk writes)
-        audio_buffer = io.BytesIO()
-        tts = gTTS(text=text, lang='en', slow=False)
-        tts.write_to_fp(audio_buffer)
-        audio_buffer.seek(0)
+        update = request.get_json()
         
-        # Send as voice message
-        await update.message.reply_voice(
-            voice=audio_buffer,
-            filename="speech.ogg",
-            caption=f"🗣️ *You said:* {text[:100]}..."
-        )
+        if "message" in update:
+            message = update["message"]
+            chat_id = message["chat"]["id"]
+            
+            # Handle /start command
+            if "text" in message:
+                text = message["text"]
+                
+                if text == "/start":
+                    welcome = "🎤 Welcome to Text to Speech Bot!\n\nSend me any text and I'll convert it to voice!"
+                    send_message(chat_id, welcome)
+                    return jsonify({"ok": True})
+                
+                elif text == "/help":
+                    help_text = "Send me any text message and I'll reply with a voice message!"
+                    send_message(chat_id, help_text)
+                    return jsonify({"ok": True})
+                
+                else:
+                    # Convert text to speech
+                    try:
+                        # Limit text length
+                        if len(text) > 1000:
+                            send_message(chat_id, "⚠️ Text too long! Send less than 1000 characters.")
+                            return jsonify({"ok": True})
+                        
+                        # Generate speech
+                        audio_buffer = io.BytesIO()
+                        tts = gTTS(text=text, lang='en', slow=False)
+                        tts.write_to_fp(audio_buffer)
+                        audio_buffer.seek(0)
+                        
+                        # Send voice
+                        send_voice(chat_id, audio_buffer.read(), f"🗣️ {text[:100]}...")
+                        
+                    except Exception as e:
+                        send_message(chat_id, "❌ Failed to convert text to speech. Try again!")
+                        print(f"Error: {e}")
         
+        return jsonify({"ok": True})
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: Could not convert text to speech. Please try again.")
-        print(f"Error: {e}")
+        print(f"Webhook error: {e}")
+        return jsonify({"ok": False}), 500
 
-async def help_command(update: Update, context):
-    """Send help message."""
-    help_text = (
-        "*How to use:*\n"
-        "1. Send /start to begin\n"
-        "2. Type any text message\n"
-        "3. Bot replies with voice!\n\n"
-        "*Commands:*\n"
-        "/start - Welcome message\n"
-        "/help - Show this help\n\n"
-        "*Tip:* Try different languages! Just write in your language."
-    )
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+def set_webhook():
+    """Set the webhook URL for the bot"""
+    webhook_url = f"https://textspeechbot.onrender.com/webhook/{TOKEN}"
+    url = f"{TELEGRAM_API_URL}/setWebhook"
+    response = requests.post(url, json={"url": webhook_url})
+    print(f"Webhook set response: {response.json()}")
+    return response.json()
 
-# === MAIN FUNCTION ===
-async def main():
-    """Initialize and run the Telegram bot."""
-    # Create application
-    application = Application.builder().token(TOKEN).build()
-    
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_to_speech))
-    
-    # Start bot (using polling)
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-    
-    # Keep the bot running
-    print("Bot is running...")
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
-
-# === ENTRY POINT ===
 if __name__ == "__main__":
-    import threading
+    # Set webhook when starting
+    set_webhook()
     
-    # Run Flask in a separate thread for health checks
-    def run_flask():
-        app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
-    
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-    
-    # Run the bot
-    try:
-        asyncio.run(main())
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(main())
+    # Run Flask server
+    app.run(host='0.0.0.0', port=PORT, debug=False)
